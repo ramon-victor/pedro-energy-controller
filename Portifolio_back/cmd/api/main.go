@@ -20,29 +20,95 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	r := gin.Default()
 
+	r := setupRouter(ctx, pool)
+	port := getPort()
+
+	log.Printf("Starting server on :%s", port)
+	log.Fatal(http.ListenAndServe(":"+port, r))
+}
+
+// setupRouter configures and returns the Gin router with all routes and middleware.
+func setupRouter(ctx context.Context, pool *pgxpool.Pool) *gin.Engine {
+	r := gin.Default()
 	r.Use(gin.Logger(), gin.Recovery())
 
-	// health rápido
-	r.GET("/health", func(c *gin.Context) { c.JSON(200, gin.H{"ok": true}) })
+	// Health check endpoint
+	r.GET("/health", healthCheckHandler)
 
-	// loga o que vier errado
-	r.NoRoute(func(c *gin.Context) {
-		log.Printf("NoRoute %s %s", c.Request.Method, c.Request.URL.Path)
-		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
-	})
-
-	// migração mínima
+	// Database schema initialization
 	ensureSchema(ctx, pool)
-	// rotas de auth
+
+	// API routes
 	auth.RegisterRoutes(r, wrap(pool))
-	port := os.Getenv("APP_PORT")
-	if port == "" {
-		port = "8080"
+
+	// Configure static file serving for frontend SPA
+	configureStaticFiles(r)
+
+	return r
+}
+
+// healthCheckHandler returns a simple health check response.
+func healthCheckHandler(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+// configureStaticFiles sets up static file serving and SPA routing.
+// In production/Docker deployments, the frontend is built and served from ./static
+func configureStaticFiles(r *gin.Engine) {
+	const staticDir = "./static"
+
+	stat, err := os.Stat(staticDir)
+	if err != nil {
+		log.Printf("Static directory not found (%v), serving API only", err)
+		r.NoRoute(apiOnlyNoRouteHandler)
+		return
 	}
-	log.Println("listening on :" + port)
-	log.Fatal(http.ListenAndServe(":"+port, r))
+
+	if !stat.IsDir() {
+		log.Printf("Static path exists but is not a directory, serving API only")
+		r.NoRoute(apiOnlyNoRouteHandler)
+		return
+	}
+
+	log.Printf("Serving static files from %s", staticDir)
+	r.Static("/assets", staticDir+"/assets")
+	r.StaticFile("/", staticDir+"/index.html")
+	r.StaticFile("/favicon.ico", staticDir+"/favicon.ico")
+	r.NoRoute(spaNoRouteHandler(staticDir))
+}
+
+// spaNoRouteHandler returns a handler for SPA client-side routing.
+// API routes get JSON 404, all other routes serve index.html.
+func spaNoRouteHandler(staticDir string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// API routes should return JSON 404, not the SPA
+		if len(c.Request.URL.Path) >= 4 && c.Request.URL.Path[:4] == "/api" {
+			log.Printf("API route not found: %s %s", c.Request.Method, c.Request.URL.Path)
+			c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+			return
+		}
+		// Serve index.html for all other routes (SPA client-side routing)
+		c.File(staticDir + "/index.html")
+	}
+}
+
+// apiOnlyNoRouteHandler returns JSON 404 for all routes when no static files are served.
+func apiOnlyNoRouteHandler(c *gin.Context) {
+	log.Printf("Route not found: %s %s", c.Request.Method, c.Request.URL.Path)
+	c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+}
+
+// getPort determines the port to listen on from environment variables.
+// Priority: PORT (Azure) > APP_PORT > default "8080"
+func getPort() string {
+	if port := os.Getenv("PORT"); port != "" {
+		return port
+	}
+	if port := os.Getenv("APP_PORT"); port != "" {
+		return port
+	}
+	return "8080"
 }
 
 type pgxWrap struct{ *pgxpool.Pool }
